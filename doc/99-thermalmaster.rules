@@ -1,0 +1,15 @@
+# udev rules for ThermalMaster thermal cameras.
+#
+# Install:
+#   sudo cp doc/99-thermalmaster.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Then re-plug the camera (or reboot).
+# Users must be in the "video" group to access the camera.
+
+# ThermalMaster P3 (VID:PID 3474:45a2)
+SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45a2", GROUP="video", MODE="0660"
+
+# ThermalMaster P1 (VID:PID 3474:45c2)
+SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45c2", GROUP="video", MODE="0660"
