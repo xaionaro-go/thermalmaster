@@ -104,7 +104,8 @@ import (
 	"github.com/xaionaro-go/thermalmaster/pkg/thermalmaster"
 )
 
-dev, err := thermalmaster.Open(thermalmaster.ModelP3)
+dev, err := thermalmaster.Open() // opens first camera found
+// Or filter: thermalmaster.Open(thermalmaster.WithSerial("P3025043DF123120418"))
 if err != nil { ... }
 defer dev.Close()
 

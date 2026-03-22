@@ -20,6 +20,11 @@ type Config struct {
 	UpscaleWorkers int
 	WindowRadius   int
 
+	// Device selection.
+	Serial     string
+	USBBus     int
+	USBAddr    int
+
 	// Camera hardware.
 	Gain       string
 	HWPalette  string
@@ -50,6 +55,11 @@ func RegisterFlags(cmd *cobra.Command, cfg *Config) {
 	cmd.Flags().IntVar(&cfg.UpscaleFactor, "upscale-factor", 2, "upscale factor for blended mode")
 	cmd.Flags().IntVar(&cfg.UpscaleWorkers, "upscale-workers", 0, "parallel workers for upscaling (0 = single-threaded)")
 	cmd.Flags().IntVar(&cfg.WindowRadius, "window-radius", 1, "bilateral filter half-window size (1 = 3x3, 2 = 5x5)")
+
+	// Device selection flags.
+	cmd.Flags().StringVar(&cfg.Serial, "serial", "", "select camera by serial number")
+	cmd.Flags().IntVar(&cfg.USBBus, "usb-bus", -1, "select camera by USB bus number")
+	cmd.Flags().IntVar(&cfg.USBAddr, "usb-addr", -1, "select camera by USB device address")
 
 	// Camera hardware flags.
 	cmd.Flags().StringVar(&cfg.Gain, "gain", "auto", "gain mode: auto, high, low")
@@ -177,7 +187,18 @@ func (c *Config) BuildLegendConfig(
 // streaming starts — some settings trigger ISP reconfiguration that disrupts
 // the USB connection if applied before the streaming interface is claimed.
 func (c *Config) SetupCamera() (_ *thermalmaster.Device, _ thermalmaster.DeviceInfo, _err error) {
-	dev, err := thermalmaster.Open(thermalmaster.ModelP3)
+	var openOpts []thermalmaster.OpenOption
+	if c.Serial != "" {
+		openOpts = append(openOpts, thermalmaster.WithSerial(c.Serial))
+	}
+	switch {
+	case c.USBBus >= 0 && c.USBAddr >= 0:
+		openOpts = append(openOpts, thermalmaster.WithUSBAddress(c.USBBus, c.USBAddr))
+	case c.USBBus >= 0:
+		openOpts = append(openOpts, thermalmaster.WithUSBBus(c.USBBus))
+	}
+
+	dev, err := thermalmaster.Open(openOpts...)
 	if err != nil {
 		return nil, thermalmaster.DeviceInfo{}, fmt.Errorf("opening P3: %w", err)
 	}

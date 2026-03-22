@@ -2,11 +2,30 @@ package thermalmaster
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/gousb"
 )
+
+// selectDevice picks a device from the list based on the open config.
+// If serial filtering is requested, each device is checked. Otherwise
+// the first device is returned.
+func selectDevice(devs []*gousb.Device, oc openConfig) *gousb.Device {
+	if oc.serial == "" {
+		return devs[0]
+	}
+
+	for _, d := range devs {
+		d.SetAutoDetach(true)
+		sn, err := d.SerialNumber()
+		if err == nil && strings.Contains(sn, oc.serial) {
+			return d
+		}
+	}
+	return nil
+}
 
 // USB control transfer constants.
 const (
@@ -47,16 +66,53 @@ func NewDeviceWithTransport(transport USBTransport, cfg ModelConfig) *Device {
 	}
 }
 
-// Open opens a ThermalMaster camera of the given model via USB.
-func Open(model Model) (_ *Device, _err error) {
-	var cfg ModelConfig
-	switch model {
-	case ModelP3:
-		cfg = ConfigP3
-	case ModelP1:
-		cfg = ConfigP1
-	default:
-		return nil, fmt.Errorf("unknown model: %d", model)
+// allConfigs lists all known model configurations keyed by PID.
+var allConfigs = map[ProductID]ModelConfig{
+	ConfigP3.PID: ConfigP3,
+	ConfigP1.PID: ConfigP1,
+}
+
+// List enumerates all connected ThermalMaster cameras without opening them.
+func List() ([]CameraInfo, error) {
+	ctx := gousb.NewContext()
+	defer ctx.Close()
+
+	devs, err := ctx.OpenDevices(func(desc *gousb.DeviceDesc) bool {
+		if desc.Vendor != gousb.ID(VendorID) {
+			return false
+		}
+		_, known := allConfigs[ProductID(desc.Product)]
+		return known
+	})
+	defer func() {
+		for _, d := range devs {
+			d.Close()
+		}
+	}()
+	if err != nil {
+		return nil, fmt.Errorf("enumerating USB devices: %w", err)
+	}
+
+	var result []CameraInfo
+	for _, d := range devs {
+		cfg := allConfigs[ProductID(d.Desc.Product)]
+		result = append(result, CameraInfo{
+			Model:   cfg.Model,
+			Config:  cfg,
+			Bus:     d.Desc.Bus,
+			Address: d.Desc.Address,
+		})
+	}
+	return result, nil
+}
+
+// Open opens a ThermalMaster camera via USB. Without options it opens the
+// first camera found. Use WithSerial, WithUSBAddress, or WithUSBBus to
+// select a specific device when multiple cameras are connected.
+func Open(opts ...OpenOption) (_ *Device, _err error) {
+	var oc openConfig
+	for _, o := range opts {
+		o.applyOpenOption(&oc)
 	}
 
 	usbCtx := gousb.NewContext()
@@ -66,18 +122,48 @@ func Open(model Model) (_ *Device, _err error) {
 		}
 	}()
 
-	usbDev, err := usbCtx.OpenDeviceWithVIDPID(gousb.ID(VendorID), gousb.ID(uint16(cfg.PID)))
-	if err != nil {
+	devs, err := usbCtx.OpenDevices(func(desc *gousb.DeviceDesc) bool {
+		if desc.Vendor != gousb.ID(VendorID) {
+			return false
+		}
+		if _, known := allConfigs[ProductID(desc.Product)]; !known {
+			return false
+		}
+		if oc.filterBus && desc.Bus != oc.bus {
+			return false
+		}
+		if oc.filterAddr && desc.Address != oc.address {
+			return false
+		}
+		return true
+	})
+	if err != nil && len(devs) == 0 {
 		return nil, fmt.Errorf("finding device: %w", err)
 	}
+
+	if len(devs) == 0 {
+		return nil, fmt.Errorf("no ThermalMaster camera found")
+	}
+
+	usbDev := selectDevice(devs, oc)
+
+	// Close all devices we're not using.
+	for _, d := range devs {
+		if d != usbDev {
+			d.Close()
+		}
+	}
+
 	if usbDev == nil {
-		return nil, fmt.Errorf("device not found (VID=%04x PID=%04x)", VendorID, cfg.PID)
+		return nil, fmt.Errorf("no camera matching serial %q", oc.serial)
 	}
 	defer func() {
 		if _err != nil {
 			usbDev.Close()
 		}
 	}()
+
+	cfg := allConfigs[ProductID(usbDev.Desc.Product)]
 
 	if err := usbDev.SetAutoDetach(true); err != nil {
 		return nil, fmt.Errorf("setting auto-detach: %w", err)
@@ -110,8 +196,7 @@ func Open(model Model) (_ *Device, _err error) {
 		config:    cfg,
 	}
 
-	// Detect device type by reading the device name, matching the logic in
-	// the vendor's get_current_device_type() logic.
+	// Detect device type by reading the device name.
 	info, err := dev.ReadDeviceInfo()
 	if err == nil {
 		dev.deviceType = DeviceTypeFromName(info.Model)
