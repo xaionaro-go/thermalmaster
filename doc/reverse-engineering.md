@@ -245,20 +245,53 @@ Same layout, 160×120 per sensor. Frame size: `2 × 242 × 160 = 77,440 bytes`.
 ### Start Sequence
 
 ```
-1. Control(0x41, 0x20, 0, 0, CmdStartStream)  → 18-byte start stream command
+1. Initial CmdStartStream handshake:
+   a. Control(0x41, 0x20, 0, 0, 18-byte command), require 18-byte OUT count
+   b. Control(0xC1, 0x22, 0, 0, 1-byte status), require one-byte response
+   c. Control(0xC1, 0x21, 0, 0, 1-byte response), require one-byte response
+   d. Control(0xC1, 0x22, 0, 0, 1-byte status), require one-byte response
 2. Sleep 1s
-3. SetInterfaceAlt(1, 1)                        → activate streaming alt setting
+3. SetInterfaceAlt(1, 1)                         → activate streaming alt setting
 4. Control(0x40, 0xEE, 0, 1, nil)               → device-level stream trigger
 5. Sleep 2s
-6. BulkRead(0x81, dummy)                        → dummy read to clear pipe
-7. Control(0x41, 0x20, 0, 0, CmdStatus)         → status command
+6. BulkRead(0x81, dummy)                         → bounded best-effort pipe priming
+7. Repeat the checked CmdStartStream handshake from step 1
 ```
 
 ### Stop Sequence
 
 ```
-1. SetInterfaceAlt(1, 0)                        → streaming idle
+1. Cancel and drain all admitted bulk reads     → no USB I/O remains in flight
+2. SetInterfaceAlt(1, 0), check result          → streaming endpoint disabled
+3. ReleaseInterface(1), check result            → streaming claim released
 ```
+
+The two USB operations are deliberately separate. The vendor UVC transport's
+release helper attempts `libusb_set_interface_alt_setting(..., 0)` before
+`libusb_release_interface`, but discards the alternate-setting result and
+returns only the release result. Linux USB core can likewise remember a failed
+alt-0 reset for later while interface release itself succeeds. Therefore
+release success does not prove the camera left its active streaming alternate
+setting. This driver records restore-pending, active, and release-pending phases
+so retries repeat exactly the unconfirmed operation and never release before a
+checked alt-0 success.
+
+The official Android preview shutdown first signals its preview worker to stop,
+waits briefly, and then closes/releases the native video stream. The fixed sleep
+is an application-thread timing aid, not a camera protocol command. Here the
+equivalent ordering is deterministic: new reads and controls are rejected,
+admitted frame-read contexts are canceled, and a wait group drains admitted
+reads plus non-cancelable control exchanges before interface teardown. No pause
+command is inferred and no vendor sleep is copied.
+
+libusb timeout zero means an unbounded transfer, so Linux bulk reads use a
+100 ms synchronous poll. Each poll checks the Go cancellation cause before and
+after the native call. A live timeout that transferred bytes returns those
+bytes successfully; a live zero-byte timeout polls again; cancellation returns
+its cause. Startup uses a bounded child context for its best-effort priming read
+and ignores all child-only bytes/errors, matching the vendor role of that read
+as pipe priming rather than a success signal, while parent cancellation still
+triggers restoration.
 
 ### Frame Data
 

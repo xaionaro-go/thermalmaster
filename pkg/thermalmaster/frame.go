@@ -45,12 +45,15 @@ func findStartMarker(buf []byte, n int) int {
 // are embedded within larger USB reads (typically 16384 bytes), so
 // synchronization scans for the 2-byte start marker pattern within each read.
 func (d *Device) ReadFrame(ctx context.Context) ([]byte, error) {
-	d.mu.Lock()
-	streaming := d.streaming
-	d.mu.Unlock()
+	readCtx, id, cancelRead, err := d.beginRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer d.finishRead(id, cancelRead)
 
-	if !streaming {
-		return nil, fmt.Errorf("not streaming")
+	streamingTransport, supportsStreaming := d.transport.(USBStreamingTransport)
+	if !supportsStreaming {
+		return nil, ErrStreamingUnsupported
 	}
 
 	frameReadSize := d.config.FrameReadSize()
@@ -62,14 +65,14 @@ func (d *Device) ReadFrame(ctx context.Context) ([]byte, error) {
 	// Once found, copy the marker and any trailing data into buf.
 	pos := 0
 	for pos == 0 {
-		n, err := d.transport.BulkRead(bulkEndpointAddr, chunk)
+		n, err := streamingTransport.BulkRead(readCtx, bulkEndpointAddr, chunk)
 		if err != nil {
 			return nil, fmt.Errorf("reading frame data: %w", err)
 		}
 
 		off := findStartMarker(chunk, n)
 		if off < 0 {
-			logger.Tracef(ctx, "sync: no start marker in %d bytes", n)
+			logger.Tracef(readCtx, "sync: no start marker in %d bytes", n)
 			continue
 		}
 
@@ -84,7 +87,7 @@ func (d *Device) ReadFrame(ctx context.Context) ([]byte, error) {
 
 	// Phase 2: read remaining frame data (pixel data + end marker).
 	for pos < frameReadSize {
-		n, err := d.transport.BulkRead(bulkEndpointAddr, chunk)
+		n, err := streamingTransport.BulkRead(readCtx, bulkEndpointAddr, chunk)
 		if err != nil {
 			return nil, fmt.Errorf("reading frame data: %w", err)
 		}
@@ -100,8 +103,8 @@ func (d *Device) ReadFrame(ctx context.Context) ([]byte, error) {
 	startMarker := ParseMarker(buf[:MarkerSize])
 	endMarker := ParseMarker(buf[frameReadSize-MarkerSize : frameReadSize])
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 
 	if startMarker.Cnt1 != endMarker.Cnt1 {
 		d.stats.MarkerMismatches++
@@ -122,6 +125,45 @@ func (d *Device) ReadFrame(ctx context.Context) ([]byte, error) {
 
 	// Return start_marker + pixel_data (without end marker).
 	return buf[:frameReadSize-MarkerSize], nil
+}
+
+func (d *Device) beginRead(parent context.Context) (
+	context.Context,
+	readID,
+	context.CancelCauseFunc,
+	error,
+) {
+	ctx, cancel := context.WithCancelCause(parent)
+	d.stateMu.Lock()
+	if d.lifecycle != deviceLifecycleOpen {
+		lifecycle := d.lifecycle
+		d.stateMu.Unlock()
+		cancel(nil)
+		return nil, 0, nil, fmt.Errorf("device is %s", lifecycle)
+	}
+	if d.streamingPhase != StreamingInterfaceActive {
+		d.stateMu.Unlock()
+		cancel(nil)
+		return nil, 0, nil, fmt.Errorf("not streaming")
+	}
+	d.inFlight.Add(1)
+	d.nextReadID++
+	id := d.nextReadID
+	if d.readCancels == nil {
+		d.readCancels = make(map[readID]context.CancelCauseFunc)
+	}
+	d.readCancels[id] = cancel
+	d.stateMu.Unlock()
+
+	return ctx, id, cancel, nil
+}
+
+func (d *Device) finishRead(id readID, cancel context.CancelCauseFunc) {
+	d.stateMu.Lock()
+	delete(d.readCancels, id)
+	d.stateMu.Unlock()
+	cancel(nil)
+	d.inFlight.Done()
 }
 
 // ExtractThermalData extracts the temperature data (rows sensor_h+2 to

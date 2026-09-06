@@ -4,10 +4,10 @@ go 1.25.5
 
 require (
 	github.com/facebookincubator/go-belt v0.0.0-20250308011339-62fb7027b11f
-	github.com/google/gousb v1.1.3
 	github.com/mazznoer/colorgrad v0.11.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
+	github.com/xaionaro-go/usb v0.0.0-20260906155530-f4a30840d616
 	golang.org/x/image v0.37.0
 	golang.org/x/sys v0.42.0
 )

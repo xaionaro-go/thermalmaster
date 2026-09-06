@@ -21,9 +21,9 @@ type Config struct {
 	WindowRadius   int
 
 	// Device selection.
-	Serial     string
-	USBBus     int
-	USBAddr    int
+	Serial  string
+	USBBus  int
+	USBAddr int
 
 	// Camera hardware.
 	Gain       string
@@ -202,9 +202,20 @@ func (c *Config) SetupCamera() (_ *thermalmaster.Device, _ thermalmaster.DeviceI
 	if err != nil {
 		return nil, thermalmaster.DeviceInfo{}, fmt.Errorf("opening P3: %w", err)
 	}
+	return c.setupOpenedCamera(dev)
+}
+
+func (c *Config) setupOpenedCamera(
+	dev *thermalmaster.Device,
+) (_ *thermalmaster.Device, _ thermalmaster.DeviceInfo, _err error) {
 	defer func() {
 		if _err != nil {
-			dev.Close()
+			if err := dev.Close(); err != nil {
+				_err = errors.Join(
+					_err,
+					fmt.Errorf("closing camera after setup failure: %w", err),
+				)
+			}
 		}
 	}()
 

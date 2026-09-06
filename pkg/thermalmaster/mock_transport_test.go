@@ -1,6 +1,7 @@
 package thermalmaster
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -20,13 +21,27 @@ type mockTransport struct {
 	// Bulk read data.
 	bulkData [][]byte
 	bulkIdx  int
+	bulkRead func(context.Context, uint8, []byte) (int, error)
 
 	// Interface state.
 	currentAlt map[int]int
 
 	// Error injection.
 	nextControlError error
+	nextControlCount *int
 	nextBulkError    error
+	controlErrors    map[string][]error
+	controlCounts    map[string][]int
+	closeError       error
+	activatePhase    StreamingInterfacePhase
+	streamingPhase   StreamingInterfacePhase
+	activateError    error
+	idleError        error
+	releaseError     error
+
+	operations   []string
+	closeCalls   int
+	afterControl func(controlCall)
 
 	closed bool
 }
@@ -46,10 +61,31 @@ type mockResponse struct {
 
 func newMockTransport() *mockTransport {
 	return &mockTransport{
-		responses:   make(map[string][]mockResponse),
-		responseIdx: make(map[string]int),
-		currentAlt:  make(map[int]int),
+		responses:     make(map[string][]mockResponse),
+		responseIdx:   make(map[string]int),
+		currentAlt:    make(map[int]int),
+		controlErrors: make(map[string][]error),
+		controlCounts: make(map[string][]int),
+		activatePhase: StreamingInterfaceActive,
 	}
+}
+
+func (m *mockTransport) addControlError(
+	requestType uint8,
+	request uint8,
+	err error,
+) {
+	key := fmt.Sprintf("%02x:%02x", requestType, request)
+	m.controlErrors[key] = append(m.controlErrors[key], err)
+}
+
+func (m *mockTransport) addControlCount(
+	requestType uint8,
+	request uint8,
+	n int,
+) {
+	key := fmt.Sprintf("%02x:%02x", requestType, request)
+	m.controlCounts[key] = append(m.controlCounts[key], n)
 }
 
 // addResponse adds a canned response for a specific request type/request pair.
@@ -97,30 +133,53 @@ func (m *mockTransport) Control(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.nextControlError != nil {
-		err := m.nextControlError
-		m.nextControlError = nil
-		return 0, err
-	}
-
 	// Record the call.
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	m.controlCalls = append(m.controlCalls, controlCall{
+	call := controlCall{
 		RequestType: requestType,
 		Request:     request,
 		Val:         val,
 		Idx:         idx,
 		Data:        dataCopy,
-	})
+	}
+	m.controlCalls = append(m.controlCalls, call)
+	m.operations = append(m.operations, fmt.Sprintf("control:%02x:%02x", requestType, request))
+
+	if m.nextControlError != nil {
+		err := m.nextControlError
+		m.nextControlError = nil
+		return 0, err
+	}
+	if m.nextControlCount != nil {
+		n := *m.nextControlCount
+		m.nextControlCount = nil
+		return n, nil
+	}
+
+	key := fmt.Sprintf("%02x:%02x", requestType, request)
+	if counts := m.controlCounts[key]; len(counts) > 0 {
+		n := counts[0]
+		m.controlCounts[key] = counts[1:]
+		return n, nil
+	}
+	if errs := m.controlErrors[key]; len(errs) > 0 {
+		err := errs[0]
+		m.controlErrors[key] = errs[1:]
+		if err != nil {
+			return 0, err
+		}
+	}
 
 	// For OUT transfers (writes), just return success.
 	if requestType&0x80 == 0 {
+		if m.afterControl != nil {
+			m.afterControl(call)
+		}
 		return len(data), nil
 	}
 
 	// For IN transfers (reads), return canned response.
-	key := fmt.Sprintf("%02x:%02x", requestType, request)
 	resps, ok := m.responses[key]
 	if !ok || len(resps) == 0 {
 		return 0, fmt.Errorf("no mock response for %s", key)
@@ -139,11 +198,24 @@ func (m *mockTransport) Control(
 	}
 
 	n := copy(data, resp.Data)
+	if m.afterControl != nil {
+		m.afterControl(call)
+	}
 	return n, nil
 }
 
-func (m *mockTransport) BulkRead(endpoint uint8, buf []byte) (int, error) {
+func (m *mockTransport) BulkRead(
+	ctx context.Context,
+	endpoint uint8,
+	buf []byte,
+) (int, error) {
 	m.mu.Lock()
+	m.operations = append(m.operations, fmt.Sprintf("bulk-read:%02x", endpoint))
+	bulkRead := m.bulkRead
+	if bulkRead != nil {
+		m.mu.Unlock()
+		return bulkRead(ctx, endpoint, buf)
+	}
 	defer m.mu.Unlock()
 
 	if m.nextBulkError != nil {
@@ -162,18 +234,67 @@ func (m *mockTransport) BulkRead(endpoint uint8, buf []byte) (int, error) {
 	return n, nil
 }
 
-func (m *mockTransport) SetInterfaceAlt(intf, alt int) error {
+func (m *mockTransport) ActivateStreamingInterface() (StreamingInterfacePhase, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.currentAlt[intf] = alt
+	m.operations = append(m.operations, "activate-streaming-interface")
+	m.streamingPhase = m.activatePhase
+	switch m.activatePhase {
+	case StreamingInterfaceActive:
+		m.currentAlt[streamingIntf] = streamingAltStart
+	case StreamingInterfaceRestorePending:
+		// Claimed, but the alternate-setting transition did not complete.
+	case StreamingInterfaceReleasePending:
+		m.currentAlt[streamingIntf] = streamingAltIdle
+	}
+	return m.activatePhase, m.activateError
+}
+
+func (m *mockTransport) SetStreamingInterfaceIdle() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.operations = append(m.operations, "set-streaming-interface-idle")
+	if m.idleError != nil {
+		err := m.idleError
+		m.idleError = nil
+		return err
+	}
+	m.currentAlt[streamingIntf] = streamingAltIdle
+	m.streamingPhase = StreamingInterfaceReleasePending
+	return nil
+}
+
+func (m *mockTransport) ReleaseStreamingInterface() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.operations = append(m.operations, "release-streaming-interface")
+	if m.releaseError != nil {
+		err := m.releaseError
+		m.releaseError = nil
+		return err
+	}
+	m.streamingPhase = StreamingInterfaceIdle
 	return nil
 }
 
 func (m *mockTransport) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.operations = append(m.operations, "close")
+	m.closeCalls++
+	if m.closeError != nil {
+		err := m.closeError
+		m.closeError = nil
+		return err
+	}
 	m.closed = true
 	return nil
+}
+
+func (m *mockTransport) operationSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.operations...)
 }
 
 // lastCommand returns the last command sent (the 18-byte command data from the

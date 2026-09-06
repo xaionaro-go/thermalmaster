@@ -14,8 +14,6 @@ github.com/go-ng/xatomic v0.0.0-20251124145245-9a7a1838d3aa h1:O/9FE0us7HUu6qwot
 github.com/go-ng/xatomic v0.0.0-20251124145245-9a7a1838d3aa/go.mod h1:jZgl0U3UbxNXehuuVozYdy75phfRsZ57j0qAmEWGdHg=
 github.com/go-ng/xsort v0.0.0-20250330112557-d2ee7f01661c h1:HJxoDBw4gpvxB+hR8qe44GPrDbOw8q2jR5W9yr3toxo=
 github.com/go-ng/xsort v0.0.0-20250330112557-d2ee7f01661c/go.mod h1:FJRei/3HqH6XVzwo61JwfpKT0rDulBRh1YOq3yWS0Cs=
-github.com/google/gousb v1.1.3 h1:xt6M5TDsGSZ+rlomz5Si5Hmd/Fvbmo2YCJHN+yGaK4o=
-github.com/google/gousb v1.1.3/go.mod h1:GGWUkK0gAXDzxhwrzetW592aOmkkqSGcj5KLEgmCVUg=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
@@ -49,6 +47,8 @@ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/xaionaro-go/usb v0.0.0-20260906155530-f4a30840d616 h1:pwgE0Vlmho8ra8+xHbV4qXTvQuDgUzbK+tZkw0zz0cw=
+github.com/xaionaro-go/usb v0.0.0-20260906155530-f4a30840d616/go.mod h1:3htA76aO+5uThYNt8wUZlRyX6dq/qyHvxfVN+812sas=
 go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
 golang.org/x/exp v0.0.0-20250813145105-42675adae3e6 h1:SbTAbRFnd5kjQXbczszQ0hdk3ctwYf3qBNH9jIsGclE=
 golang.org/x/exp v0.0.0-20250813145105-42675adae3e6/go.mod h1:4QTo5u+SEIbbKW1RacMZq1YEfOBqeXa19JeshGi+zc4=

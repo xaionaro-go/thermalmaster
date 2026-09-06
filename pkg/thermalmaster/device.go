@@ -1,31 +1,12 @@
 package thermalmaster
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/gousb"
 )
-
-// selectDevice picks a device from the list based on the open config.
-// If serial filtering is requested, each device is checked. Otherwise
-// the first device is returned.
-func selectDevice(devs []*gousb.Device, oc openConfig) *gousb.Device {
-	if oc.serial == "" {
-		return devs[0]
-	}
-
-	for _, d := range devs {
-		d.SetAutoDetach(true)
-		sn, err := d.SerialNumber()
-		if err == nil && strings.Contains(sn, oc.serial) {
-			return d
-		}
-	}
-	return nil
-}
 
 // USB control transfer constants.
 const (
@@ -44,12 +25,50 @@ const (
 
 // Device represents an opened ThermalMaster camera connected via USB.
 type Device struct {
-	transport  USBTransport
-	config     ModelConfig
-	deviceType DeviceType
-	streaming  bool
-	stats      FrameStats
-	mu         sync.Mutex
+	transport      USBTransport
+	config         ModelConfig
+	deviceType     DeviceType
+	lifecycleMu    sync.Mutex
+	controlMu      sync.Mutex
+	stateMu        sync.Mutex
+	inFlight       sync.WaitGroup
+	lifecycle      deviceLifecycle
+	streamingPhase StreamingInterfacePhase
+	stats          FrameStats
+	nextReadID     readID
+	readCancels    map[readID]context.CancelCauseFunc
+	nextControlID  controlID
+	controlCancels map[controlID]context.CancelCauseFunc
+}
+
+type readID uint64
+type controlID uint64
+
+type deviceLifecycle uint8
+
+const (
+	deviceLifecycleOpen deviceLifecycle = iota
+	deviceLifecycleStarting
+	deviceLifecycleStopping
+	deviceLifecycleClosing
+	deviceLifecycleClosed
+)
+
+func (l deviceLifecycle) String() string {
+	switch l {
+	case deviceLifecycleOpen:
+		return "open"
+	case deviceLifecycleStarting:
+		return "starting"
+	case deviceLifecycleStopping:
+		return "stopping"
+	case deviceLifecycleClosing:
+		return "closing"
+	case deviceLifecycleClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
 }
 
 // DeviceType returns the detected device type.
@@ -74,36 +93,7 @@ var allConfigs = map[ProductID]ModelConfig{
 
 // List enumerates all connected ThermalMaster cameras without opening them.
 func List() ([]CameraInfo, error) {
-	ctx := gousb.NewContext()
-	defer ctx.Close()
-
-	devs, err := ctx.OpenDevices(func(desc *gousb.DeviceDesc) bool {
-		if desc.Vendor != gousb.ID(VendorID) {
-			return false
-		}
-		_, known := allConfigs[ProductID(desc.Product)]
-		return known
-	})
-	defer func() {
-		for _, d := range devs {
-			d.Close()
-		}
-	}()
-	if err != nil {
-		return nil, fmt.Errorf("enumerating USB devices: %w", err)
-	}
-
-	var result []CameraInfo
-	for _, d := range devs {
-		cfg := allConfigs[ProductID(d.Desc.Product)]
-		result = append(result, CameraInfo{
-			Model:   cfg.Model,
-			Config:  cfg,
-			Bus:     d.Desc.Bus,
-			Address: d.Desc.Address,
-		})
-	}
-	return result, nil
+	return listCameras()
 }
 
 // Open opens a ThermalMaster camera via USB. Without options it opens the
@@ -115,106 +105,51 @@ func Open(opts ...OpenOption) (_ *Device, _err error) {
 		o.applyOpenOption(&oc)
 	}
 
-	usbCtx := gousb.NewContext()
-	defer func() {
-		if _err != nil {
-			usbCtx.Close()
-		}
-	}()
-
-	devs, err := usbCtx.OpenDevices(func(desc *gousb.DeviceDesc) bool {
-		if desc.Vendor != gousb.ID(VendorID) {
-			return false
-		}
-		if _, known := allConfigs[ProductID(desc.Product)]; !known {
-			return false
-		}
-		if oc.filterBus && desc.Bus != oc.bus {
-			return false
-		}
-		if oc.filterAddr && desc.Address != oc.address {
-			return false
-		}
-		return true
-	})
-	if err != nil && len(devs) == 0 {
-		return nil, fmt.Errorf("finding device: %w", err)
-	}
-
-	if len(devs) == 0 {
-		return nil, fmt.Errorf("no ThermalMaster camera found")
-	}
-
-	usbDev := selectDevice(devs, oc)
-
-	// Close all devices we're not using.
-	for _, d := range devs {
-		if d != usbDev {
-			d.Close()
-		}
-	}
-
-	if usbDev == nil {
-		return nil, fmt.Errorf("no camera matching serial %q", oc.serial)
-	}
-	defer func() {
-		if _err != nil {
-			usbDev.Close()
-		}
-	}()
-
-	cfg := allConfigs[ProductID(usbDev.Desc.Product)]
-
-	if err := usbDev.SetAutoDetach(true); err != nil {
-		return nil, fmt.Errorf("setting auto-detach: %w", err)
-	}
-
-	usbCfg, err := usbDev.Config(usbConfigNum)
-	if err != nil {
-		return nil, fmt.Errorf("claiming USB config %d: %w", usbConfigNum, err)
-	}
-	defer func() {
-		if _err != nil {
-			usbCfg.Close()
-		}
-	}()
-
-	intf0, err := usbCfg.Interface(controlIntf, controlAlt)
-	if err != nil {
-		return nil, fmt.Errorf("claiming interface %d: %w", controlIntf, err)
-	}
-
-	transport := &goUSBTransport{
-		ctx:   usbCtx,
-		dev:   usbDev,
-		cfg:   usbCfg,
-		intf0: intf0,
-	}
-
-	dev := &Device{
-		transport: transport,
-		config:    cfg,
-	}
-
-	// Detect device type by reading the device name.
-	info, err := dev.ReadDeviceInfo()
-	if err == nil {
-		dev.deviceType = DeviceTypeFromName(info.Model)
-	}
-
-	return dev, nil
+	return openDevice(oc)
 }
 
 // Close releases all USB resources held by the device.
 func (d *Device) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
 
-	if d.streaming {
-		d.stopStreamingLocked()
+	d.stateMu.Lock()
+	if d.lifecycle == deviceLifecycleClosed {
+		d.stateMu.Unlock()
+		return nil
+	}
+	d.lifecycle = deviceLifecycleClosing
+	cancels := d.lifecycleCancelSnapshotLocked()
+	d.stateMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel(errStreamingStopped)
+	}
+	d.inFlight.Wait()
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	restoreErr := d.restoreStreaming()
+	d.stateMu.Lock()
+	streamingIdle := d.streamingPhase == StreamingInterfaceIdle
+	d.stateMu.Unlock()
+	if restoreErr != nil && !streamingIdle {
+		return fmt.Errorf("restoring streaming interface: %w", restoreErr)
 	}
 
-	return d.transport.Close()
+	closeErr := d.transport.Close()
+	if closeErr == nil || isTerminalUSBResourceError(closeErr) {
+		d.stateMu.Lock()
+		d.lifecycle = deviceLifecycleClosed
+		d.stateMu.Unlock()
+	}
+	if closeErr != nil {
+		return errors.Join(
+			wrapError("restoring streaming interface", restoreErr),
+			fmt.Errorf("closing USB transport: %w", closeErr),
+		)
+	}
+	return wrapError("restoring streaming interface", restoreErr)
 }
 
 // Config returns the model configuration for this device.
@@ -224,21 +159,104 @@ func (d *Device) Config() ModelConfig {
 
 // Stats returns a snapshot of frame statistics.
 func (d *Device) Stats() FrameStats {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	return d.stats
 }
 
+func (d *Device) readCancelSnapshotLocked() []context.CancelCauseFunc {
+	cancels := make([]context.CancelCauseFunc, 0, len(d.readCancels))
+	for _, cancel := range d.readCancels {
+		cancels = append(cancels, cancel)
+	}
+	return cancels
+}
+
+func (d *Device) lifecycleCancelSnapshotLocked() []context.CancelCauseFunc {
+	cancels := d.readCancelSnapshotLocked()
+	for _, cancel := range d.controlCancels {
+		cancels = append(cancels, cancel)
+	}
+	return cancels
+}
+
+func (d *Device) beginControl(
+	parent context.Context,
+) (context.Context, controlID, error) {
+	return d.beginControlInLifecycle(parent, deviceLifecycleOpen)
+}
+
+func (d *Device) beginControlInLifecycle(
+	parent context.Context,
+	allowedLifecycle deviceLifecycle,
+) (context.Context, controlID, error) {
+	controlCtx, id, err := d.registerControlInLifecycle(parent, allowedLifecycle)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	d.controlMu.Lock()
+	if cause := context.Cause(controlCtx); cause != nil {
+		d.endControl(id)
+		return nil, 0, cause
+	}
+	return controlCtx, id, nil
+}
+
+func (d *Device) registerControlInLifecycle(
+	parent context.Context,
+	allowedLifecycle deviceLifecycle,
+) (context.Context, controlID, error) {
+	controlCtx, cancel := context.WithCancelCause(parent)
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if d.lifecycle != allowedLifecycle {
+		lifecycle := d.lifecycle
+		err := fmt.Errorf("device is %s", lifecycle)
+		cancel(err)
+		return nil, 0, err
+	}
+	id := d.registerControlLocked(cancel)
+	return controlCtx, id, nil
+}
+
+func (d *Device) registerControlLocked(cancel context.CancelCauseFunc) controlID {
+	if d.controlCancels == nil {
+		d.controlCancels = make(map[controlID]context.CancelCauseFunc)
+	}
+	id := d.nextControlID
+	d.nextControlID++
+	d.controlCancels[id] = cancel
+	d.inFlight.Add(1)
+	return id
+}
+
+func (d *Device) endControl(id controlID) {
+	d.controlMu.Unlock()
+	d.stateMu.Lock()
+	cancel := d.controlCancels[id]
+	delete(d.controlCancels, id)
+	d.stateMu.Unlock()
+	cancel(nil)
+	d.inFlight.Done()
+}
+
 // sendCommand sends an 18-byte command via USB control transfer.
-func (d *Device) sendCommand(cmd [CommandSize]byte) error {
-	_, err := d.transport.Control(bmRequestTypeOut, bRequestSendCmd, 0, 0, cmd[:])
-	return err
+func (d *Device) sendCommand(ctx context.Context, cmd [CommandSize]byte) error {
+	n, err := d.control(ctx, bmRequestTypeOut, bRequestSendCmd, 0, 0, cmd[:])
+	if err != nil {
+		return err
+	}
+	if n != len(cmd) {
+		return fmt.Errorf("got %d bytes, want %d", n, len(cmd))
+	}
+	return nil
 }
 
 // readResponse reads a response of the given length via USB control transfer.
-func (d *Device) readResponse(length int) ([]byte, error) {
+func (d *Device) readResponse(ctx context.Context, length int) ([]byte, error) {
 	buf := make([]byte, length)
-	n, err := d.transport.Control(bmRequestTypeIn, bRequestReadResp, 0, 0, buf)
+	n, err := d.control(ctx, bmRequestTypeIn, bRequestReadResp, 0, 0, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -248,12 +266,15 @@ func (d *Device) readResponse(length int) ([]byte, error) {
 // readStatus polls the status register until the camera is ready.
 // Matches the usb_status_check_done loop in the vendor's USB transport:
 // status=1 means busy (retry after 1ms), status>=2 means done.
-func (d *Device) readStatus() (byte, error) {
+func (d *Device) readStatus(ctx context.Context) (byte, error) {
 	buf := make([]byte, 1)
 	for range statusPollLimit {
-		_, err := d.transport.Control(bmRequestTypeIn, bRequestReadStatus, 0, 0, buf)
+		n, err := d.control(ctx, bmRequestTypeIn, bRequestReadStatus, 0, 0, buf)
 		if err != nil {
 			return 0, err
+		}
+		if n != len(buf) {
+			return 0, fmt.Errorf("got %d bytes, want %d", n, len(buf))
 		}
 
 		if buf[0] != 1 {
@@ -262,9 +283,44 @@ func (d *Device) readStatus() (byte, error) {
 
 		// Status 1 = busy. Wait 1ms before polling again, matching the
 		// vendor's usleep(1000) in usb_status_check_done.
-		time.Sleep(time.Millisecond)
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return 0, context.Cause(ctx)
+		case <-timer.C:
+		}
 	}
 	return buf[0], fmt.Errorf("status poll timeout (stuck at busy)")
+}
+
+func (d *Device) control(
+	ctx context.Context,
+	requestType, request uint8,
+	value, index uint16,
+	data []byte,
+) (int, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return 0, cause
+	}
+	n, err := d.transport.Control(requestType, request, value, index, data)
+	if cause := context.Cause(ctx); cause != nil {
+		return n, errors.Join(err, cause)
+	}
+	return n, err
+}
+
+func wrapError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func isTerminalUSBResourceError(err error) bool {
+	return errors.Is(err, ErrUSBNoDevice) || errors.Is(err, ErrUSBNotFound)
 }
 
 // SendCommandWithResponse sends a command, reads status, reads response, reads
@@ -273,22 +329,25 @@ func (d *Device) SendCommandWithResponse(
 	cmd [CommandSize]byte,
 	respLen int,
 ) ([]byte, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	ctx, controlID, err := d.beginControl(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer d.endControl(controlID)
 
-	if err := d.sendCommand(cmd); err != nil {
+	if err := d.sendCommand(ctx, cmd); err != nil {
 		return nil, fmt.Errorf("sending command: %w", err)
 	}
-	if _, err := d.readStatus(); err != nil {
+	if _, err := d.readStatus(ctx); err != nil {
 		return nil, fmt.Errorf("reading status after command: %w", err)
 	}
 
-	resp, err := d.readResponse(respLen)
+	resp, err := d.readResponse(ctx, respLen)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
-	if _, err := d.readStatus(); err != nil {
+	if _, err := d.readStatus(ctx); err != nil {
 		return nil, fmt.Errorf("reading status after response: %w", err)
 	}
 	return resp, nil
@@ -296,13 +355,16 @@ func (d *Device) SendCommandWithResponse(
 
 // SendCommandNoResponse sends a command and reads status only (no response data).
 func (d *Device) SendCommandNoResponse(cmd [CommandSize]byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	ctx, controlID, err := d.beginControl(context.Background())
+	if err != nil {
+		return err
+	}
+	defer d.endControl(controlID)
 
-	if err := d.sendCommand(cmd); err != nil {
+	if err := d.sendCommand(ctx, cmd); err != nil {
 		return fmt.Errorf("sending command: %w", err)
 	}
-	if _, err := d.readStatus(); err != nil {
+	if _, err := d.readStatus(ctx); err != nil {
 		return fmt.Errorf("reading status: %w", err)
 	}
 	return nil

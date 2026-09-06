@@ -68,10 +68,7 @@ func TestClose(t *testing.T) {
 func TestClose_WhileStreaming(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	// Simulate streaming state.
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	err := dev.Close()
 	require.NoError(t, err)
@@ -138,6 +135,18 @@ func TestSetCommands_NoArg_USBError(t *testing.T) {
 			assert.Contains(t, err.Error(), "USB disconnected")
 		})
 	}
+}
+
+func TestSendCommandRejectsShortSuccessfulOUTTransfer(t *testing.T) {
+	dev, mock := newMockDevice()
+	shortCount := CommandSize - 1
+	mock.nextControlCount = &shortCount
+
+	err := dev.SendCommandNoResponse(CmdShutter)
+
+	assert.ErrorContains(t, err, "got 17 bytes, want 18")
+	assert.Equal(t, 1, mock.countCalls(bmRequestTypeOut, bRequestSendCmd))
+	assert.Zero(t, mock.countCalls(bmRequestTypeIn, bRequestReadStatus))
 }
 
 // ---------------------------------------------------------------------------
@@ -937,10 +946,7 @@ func TestReadFrame_NotStreaming(t *testing.T) {
 func TestReadFrame_Success(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	// Set streaming state.
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	cfg := ConfigP3
 	frameReadSize := cfg.FrameReadSize()
@@ -950,8 +956,8 @@ func TestReadFrame_Success(t *testing.T) {
 	frame := make([]byte, frameReadSize)
 
 	// Start marker (12 bytes).
-	frame[0] = 0x0C           // Length
-	frame[1] = SyncStartEven  // Sync
+	frame[0] = 0x0C                                 // Length
+	frame[1] = SyncStartEven                        // Sync
 	binary.LittleEndian.PutUint32(frame[2:6], 100)  // Cnt1
 	binary.LittleEndian.PutUint32(frame[6:10], 200) // Cnt2
 	binary.LittleEndian.PutUint16(frame[10:12], 40) // Cnt3
@@ -1008,9 +1014,7 @@ func TestReadFrame_Success(t *testing.T) {
 func TestReadFrame_EmbeddedMarker(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	cfg := ConfigP3
 	frameReadSize := cfg.FrameReadSize()
@@ -1073,9 +1077,7 @@ func TestReadFrame_EmbeddedMarker(t *testing.T) {
 func TestReadFrame_MarkerMismatch(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	cfg := ConfigP3
 	frameReadSize := cfg.FrameReadSize()
@@ -1130,9 +1132,7 @@ func TestReadFrame_MarkerMismatch(t *testing.T) {
 func TestReadFrame_BulkReadError(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	mock.nextBulkError = fmt.Errorf("bulk read timeout")
 
@@ -1154,10 +1154,10 @@ func TestStartStreaming(t *testing.T) {
 	// 3. readResponse(1) -> IN 0xC1:0x21
 	// 4. readStatus -> IN 0xC1:0x22
 	// (sleep 1s)
-	// 5. SetInterfaceAlt(1,1)
+	// 5. ActivateStreamingInterface
 	// 6. Control(0x40, 0xEE, 0, 1, nil) -> OUT
 	// (sleep 2s)
-	// 7. BulkRead (initial, may fail)
+	// 7. BulkRead (initial stream data)
 	// 8. sendCommand(CmdStartStream) -> OUT control
 	// 9. readStatus -> IN 0xC1:0x22
 	// 10. readResponse(1) -> IN 0xC1:0x21
@@ -1168,7 +1168,7 @@ func TestStartStreaming(t *testing.T) {
 	mock.addReadResponse([]byte{0x01})
 	mock.addStatusResponse(0x03)
 
-	// Bulk read (initial, expected to fail -- add one chunk).
+	// Provide one chunk for the initial bulk read.
 	mock.bulkData = append(mock.bulkData, make([]byte, 100))
 
 	// Second start_stream sequence.
@@ -1203,10 +1203,7 @@ func TestStartStreaming_SendCommandError(t *testing.T) {
 func TestStopStreaming(t *testing.T) {
 	dev, mock := newMockDevice()
 
-	// Manually set streaming state.
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	err := dev.StopStreaming()
 	require.NoError(t, err)
@@ -1330,12 +1327,10 @@ func TestStats_Initial(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIsStreaming(t *testing.T) {
-	dev, _ := newMockDevice()
+	dev, mock := newMockDevice()
 	assert.False(t, dev.IsStreaming())
 
-	dev.mu.Lock()
-	dev.streaming = true
-	dev.mu.Unlock()
+	setMockStreamingActive(dev, mock)
 
 	assert.True(t, dev.IsStreaming())
 }

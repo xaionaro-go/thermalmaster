@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -37,7 +38,7 @@ func run(
 	cfg cliflags.Config,
 	skipFrames int,
 	outputPath string,
-) error {
+) (_err error) {
 	sensor, err := cfg.ParseSensor()
 	if err != nil {
 		return err
@@ -52,13 +53,12 @@ func run(
 	if err != nil {
 		return err
 	}
-	defer dev.Close()
+	defer joinDeviceCloseError(&_err, dev)
 	fmt.Fprintf(os.Stderr, "Camera: %s (FW %s, SN %s)\n", info.Model, info.FWVersion, info.Serial)
 
 	if err := dev.StartStreaming(context.Background()); err != nil {
 		return fmt.Errorf("starting stream: %w", err)
 	}
-	defer dev.StopStreaming()
 
 	// Apply hardware settings after streaming starts — some settings (palette,
 	// gain) trigger ISP reconfiguration that disrupts USB before streaming.
@@ -132,4 +132,10 @@ func run(
 
 	fmt.Fprintf(os.Stderr, "Saved %dx%d image to %s\n", outW, outH, outputPath)
 	return nil
+}
+
+func joinDeviceCloseError(resultErr *error, dev *thermalmaster.Device) {
+	if err := dev.Close(); err != nil {
+		*resultErr = errors.Join(*resultErr, fmt.Errorf("closing camera: %w", err))
+	}
 }
